@@ -1,0 +1,355 @@
+---
+title: "Final Project: Complementary Data Analylsis"
+author: "Connor Parrish"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r}
+library(nnet)
+library(ggplot2)
+library(dplyr)
+library(keras)
+library(tensorflow)
+library(caret)
+library(doParallel)
+library(knitr)
+library(gbm)
+library(ranger)
+```
+
+```{r}
+# Load & Create Full Data Sets
+train_x<-read.csv('MNISTTrainXV2.csv')
+train_y<-read.csv('MNISTTrainY.csv')
+valid_x<-read.csv('MNISTValidationX.csv')
+valid_y<-read.csv('MNISTValidationY.csv')
+test_x<-read.csv('MNISTTestXRand.csv')
+test_y<-read.csv('MNISTTestYRand.csv')
+train<-data.frame(train_x,train_y)
+valid<-data.frame(valid_x,valid_y)
+test<-data.frame(test_x,test_y)
+```
+
+# Multinomial Logistic Regression
+
+```{r,eval=FALSE}
+set.seed(123)
+
+#Create Data Set Appropriate for Multinomial function
+train1<-train
+train1$label <- factor(train1$label)
+valid1<-valid
+valid1$label<-factor(valid1$label)
+
+#Multinomial Regression
+
+ncores <- detectCores()
+cl <- makeCluster(ncores - 2)
+registerDoParallel(cl)
+# Get time of code execution
+multistart <- Sys.time()
+mn_logit <- nnet::multinom(label ~., data = train1, trace = FALSE, MaxNWts = 2000)
+multitime <- Sys.time() - multistart
+stopCluster(cl)
+multitime<-as.numeric(multitime)
+
+#Predict Bayes' class using validation set
+mn_prob <- predict(mn_logit, newdata = valid1[, -145], type = "probs")
+
+#Calculate Log Loss
+##Create Dummy Outcomes
+dummy_outcome <- dummyVars(~label, data = valid1,levelsOnly = TRUE)
+dummy_outcome <- predict(dummy_outcome, newdata = valid1)
+#Multiply to get prob correct. Take the row sum.
+prob_correct <- rowSums(dummy_outcome*mn_prob)
+#Log Loss
+multinom_logloss <- -mean(log(prob_correct))
+
+#Calculate Miss Class Rate
+##Find max class & compare to truth
+max_class <- apply(mn_prob,1,which.max)
+max_class <- colnames(mn_prob)[max_class]
+multinom_misclass <- mean(max_class != valid1$label)
+```
+
+```{r}
+#hard code values
+multinom_logloss<-0.4548859
+multinom_misclass<-0.1286667
+multitime<-1.12598
+
+
+#Print Summary Table 
+Method<-c('Multinomial Logistic Regression')
+Log_Loss<-c(multinom_logloss)
+Misclassification_Rate<-c(multinom_misclass)
+Duration_Minutes<-c(multitime)
+tab<-data.frame(Method,Log_Loss,Misclassification_Rate,Duration_Minutes)
+kable(tab,caption='Multinomial Logistic Regression Summary Table',align=c('l','l'))
+```
+
+
+# Neural Networks
+
+```{r,eval=FALSE}
+#Feedforward
+set.seed(123)
+
+#Organize Data
+##Matrix Format
+x_train <- array_reshape(train_x, c(nrow(train_x), 144))
+x_valid <- array_reshape(valid_x, c(nrow(valid_x), 144))
+##Normalization
+x_train <- x_train / 255
+x_valid <- x_valid / 255
+##Make Classifications Binary
+y_train <- to_categorical(train_y, 10)
+y_valid <- to_categorical(valid_y, 10)
+##Calculate Mean & SD of training set
+mean_train <- apply(x_train, 2, mean)
+sd_train <- apply(x_train, 2, sd)
+## Normalize using these scaling parameters
+x_train_norm <- scale(x_train, center = mean_train, scale = sd_train)#FIGURE OUT WHY THIS IS A THING
+x_valid_norm <- scale(x_valid, center = mean_train, scale = sd_train)
+
+#Build FF Neural Network
+ff <- keras_model_sequential() %>%
+  layer_dense(units=80,activation='relu',input_shape=c(144))%>%
+  layer_dropout(rate=0.25)%>%
+  layer_dense(units=40,activation='relu')%>%
+  layer_dropout(rate=0.25)%>%
+  layer_dense(units = 20, activation = "relu") %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_dense(units = 10, activation = "softmax")
+
+#Learning Rate Exponential Decay (such that it learns more at the start and fine tunes at the end)
+initial_learning_rate <- 0.05
+lr_schedule <- learning_rate_schedule_exponential_decay(initial_learning_rate,decay_steps = 100000,decay_rate = 0.96,staircase = TRUE)
+
+#Tune Number of Epochs
+early_stop <- callback_early_stopping(monitor = "val_loss", patience = 5)
+
+#Train Model & Record Time
+ncores <- detectCores()
+cl <- makeCluster(ncores - 2)
+registerDoParallel(cl)
+ffstart <- Sys.time() 
+ffmodel <- ff %>% 
+  compile(optimizer=optimizer_sgd(learning_rate = lr_schedule), loss='categorical_crossentropy' , metrics='accuracy') %>%
+  fit(x_train_norm,y_train,epochs=60,batch_size=128,validation_data=list(x_valid_norm,y_valid),callbacks = list(early_stop))
+fftime <- Sys.time() - ffstart
+stopCluster(cl)
+
+#Store Log Loss and Miss Rate Values
+ffscore <- ff %>% evaluate(x_valid_norm,y_valid)
+fflogloss<-ffscore[1][[1]]
+ffmissrate<- 1-ffscore[2][[1]]
+epoch<-length(ffmodel$metrics$loss)
+
+#Log Loss & Accuracy vs. Epoch Plots
+plot(ffmodel)
+```
+
+```{r}
+#hard code values
+fflogloss<-0.162896692752838
+ffmissrate<-0.0412666797637939
+epoch<-60
+fftime<-58.24282/60
+#print results
+
+print(paste('The log loss of the feedforward neural network function is',fflogloss,', while the miss rate of the feedforward neural network function is',ffmissrate,'.',epoch,'epochs were used over',fftime,'minutes.'))
+```
+
+```{r}
+#Convolutional
+set.seed(123)
+
+#Organize Data
+## Reshape the input data to have 3D shape
+x_train <- array_reshape(train_x, c(nrow(train_x), 12, 12, 1))
+x_valid <- array_reshape(valid_x, c(nrow(valid_x), 12, 12, 1))
+##Normalize
+x_train <- x_train / 255
+x_valid <- x_valid / 255
+##Make categories binary
+y_train <- to_categorical(train_y, 10)
+y_valid <- to_categorical(valid_y, 10)
+
+#Build Convolutional Neural Network
+conv <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 16, kernel_size = c(3, 3), activation = "relu", input_shape = c(12, 12, 1)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 32, kernel_size = c(3, 3), activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_dense(units = 10, activation = "softmax")
+
+#Learning Rate Exponential Decay (such that it learns more at the start and fine tunes at the end)
+initial_learning_rate <- 0.05
+lr_schedule <- learning_rate_schedule_exponential_decay(initial_learning_rate,decay_steps = 100000,decay_rate = 0.96,staircase = TRUE)
+
+# Tune Number of Epochs
+early_stop <- callback_early_stopping(monitor = "val_loss", patience = 5)
+
+#Train Model & Record Time
+ncores <- detectCores()
+cl <- makeCluster(ncores - 2)
+registerDoParallel(cl)
+convstart <- Sys.time()
+convmodel <- conv %>% 
+  compile(optimizer = optimizer_sgd(learning_rate = lr_schedule), loss = 'categorical_crossentropy', metrics = 'accuracy') %>%
+  fit(x_train, y_train, epochs = 60, batch_size = 128, validation_data = list(x_valid, y_valid), callbacks = list(early_stop))
+convtime <- Sys.time() - convstart
+stopCluster(cl)
+
+#Store Log Loss and Miss Rate Values
+convscore<- conv %>% evaluate(x_valid,y_valid)
+convlogloss<-convscore[1][[1]]
+convmissrate<- 1-convscore[2][[1]]
+epoch1<-length(convmodel$metrics$loss)
+
+#Log Loss & Accuracy vs. Epoch Plots
+plot(convmodel)
+```
+
+```{r}
+#hard code values
+convlogloss<-0.110780112445354
+convmissrate<-0.0339333415031433
+epoch1<-51
+convtime<-1.65889083147049
+
+#print values
+print(paste('The log loss of the convolutional neural network function is',convlogloss,', while the miss rate of the convolutional neural network function is',convmissrate,'.',epoch1,'epochs were used over',convtime,'minutes.'))
+```
+
+```{r}
+#Comparison Table
+Method<-c('Feedforward Neural Network','Convolutional Neural Network')
+Tuning_Parameters<-c('γinitial = 0.05, epochs = 60, batch size = 128 ','γinitial = 0.05, epochs = 51, batch size = 128')
+Log_Loss<-c(fflogloss,convlogloss)
+Misclassification_Rate<-c(ffmissrate,convmissrate)
+Duration_Minutes<-c(fftime,convtime)
+tab<-data.frame(Method,Tuning_Parameters,Log_Loss,Misclassification_Rate,Duration_Minutes)
+tab <- tab %>% arrange(Log_Loss)
+kable(tab,caption='Neural Network Comparison Table',align=c('l','l'))
+```
+
+
+# Trees
+
+```{r,eval=FALSE}
+#GBM Boosted Tree
+set.seed(123)
+
+#Tune d and m. Broad search.
+tree_check <- matrix(ncol = 3, nrow = 5)
+depths <- c(1,3,5)
+ncores <- detectCores()
+cl <- makeCluster(ncores - 2)
+registerDoParallel(cl)
+for(i in 1:length(depths)){
+  boost_tree <- gbm(label ~ ., distribution = "multinomial", data = train1, n.trees = 100, interaction.depth = depths[i], shrinkage = .05, cv.folds = 5)
+  tree_check[i,] <- c(depths[i],min(boost_tree$cv.error),which.min(boost_tree$cv.error))
+}
+stopCluster(cl)
+
+#Get lowest EPE d and m
+opt_d <- tree_check[which.min(tree_check[,2]),1]
+opt_m <- tree_check[which.min(tree_check[,2]),3]
+
+#Rerun tree with optimal d and m. Record time.
+ncores <- detectCores()
+cl <- makeCluster(ncores - 2)
+registerDoParallel(cl)
+gbmstart<-Sys.time()
+boost_tree <- gbm(label ~ ., distribution = "multinomial", data = train1, n.trees = opt_m, interaction.depth = opt_d, shrinkage = .05, cv.folds = 5)
+gbmtime<-Sys.time()-gbmstart
+stopCluster(cl)
+gbmtime<-as.numeric(gbmtime)#transform to number
+
+#CV error = logLoss
+boost_tree_log_loss <- boost_tree$cv.error[opt_m]
+
+#MissRate
+max_class <- apply(boost_tree$cv.fitted,1,which.max)
+boost_tree_misclass_rate <- mean(max_class != as.numeric(train1$label))
+
+```
+
+```{r}
+#hard coding above values
+opt_d<-5
+opt_m<-100 #model took too long to load, so only 100 trees could be used
+boost_tree_log_loss<-0.3362331
+boost_tree_misclass_rate<-0.08428
+gbmtime<-12.32908
+```
+
+```{r,eval=FALSE}
+#Random Forest
+set.seed(123)
+
+#Tune for M. Broad search. 
+m_values1 <- c(1,50,100,143)
+oob_errors <- c()
+ncores <- detectCores()
+cl <- makeCluster(ncores - 2)
+registerDoParallel(cl)
+for(i in 1:length(m_values1)){
+  ctree_rf <- ranger(label ~ ., data = train1, num.trees = 100, probability = TRUE, mtry = m_values1[i], classification = TRUE)
+  oob_errors[i] <- ctree_rf$prediction.error
+}
+stopCluster(cl)
+
+#Get lowest EPE m
+opt_m1 <- m_values1[which.min(oob_errors)]
+
+#Rerun tree with optimal m. Record time
+registerDoParallel(cl)
+rfstart<-Sys.time()
+ctree_rf <- ranger(label ~ ., data = train1, num.trees = 100, probability = TRUE, mtry = opt_m1, classification = TRUE, importance = "permutation")
+rftime<-Sys.time()-rfstart
+stopCluster(cl)
+rftime<-as.numeric(rftime) #transform variable to number
+
+#Log Loss
+oob_preds <- ctree_rf$predictions
+dummy_outcome <- dummyVars(~label, data = train1,levelsOnly = TRUE)
+dummy_outcome <- predict(dummy_outcome, newdata = train1)
+prob_correct <- rowSums(dummy_outcome*oob_preds)
+prob_correct[prob_correct == 0] <- min(prob_correct[prob_correct != 0])#Recode any 0 probabilities
+ctree_rf_logloss <- -mean(log(prob_correct))
+
+#MissClass Rate
+max_class <- apply(oob_preds,1,which.max)
+max_class <- colnames(oob_preds)[max_class]
+ctree_rf_misclass <- mean(max_class != train1$label)
+
+```
+
+```{r}
+#hard code values
+opt_m1<-100 #model took too long to load, so only 100 trees could be used
+ctree_rf_logloss<-0.2987559
+ctree_rf_misclass<-0.06012
+rftime<-2.892061
+```
+
+# Comparison Table
+
+```{r}
+#Comparison Table
+Method<-c('Multinomial Logistic Regression','Feedforward Neural Network','Convolutional Neural Network','GBM Boosted Tree','Random Forest')
+Tuning_Parameters<-c('','γinitial = 0.05, epochs = 60, batch size = 128 ','γinitial = 0.05, epochs = 51, batch size = 128','D=5, M=100','M=100')
+Log_Loss<-c(multinom_logloss,fflogloss,convlogloss,boost_tree_log_loss,ctree_rf_logloss)
+Misclassification_Rate<-c(multinom_misclass,ffmissrate,convmissrate,boost_tree_misclass_rate,ctree_rf_misclass)
+Duration_Minutes<-c(multitime,fftime,convtime,gbmtime,rftime)
+tab<-data.frame(Method,Tuning_Parameters,Log_Loss,Misclassification_Rate,Duration_Minutes)
+tab <- tab %>% arrange(Log_Loss)
+kable(tab,caption='All-Method Comparison Table',align=c('l','l'))
+```
+
